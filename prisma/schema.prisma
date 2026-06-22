@@ -1,0 +1,552 @@
+// prisma/schema.prisma
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Admin {
+  id              String   @id @default(uuid())
+  username        String   @unique
+  email           String   @unique
+  password        String
+  fullName        String
+  role            Role     @default(ADMIN)
+  isActive        Boolean  @default(true)
+  lastLoginAt     DateTime?
+  loginAttempts   Int      @default(0)
+  lockedUntil     DateTime?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  sessions        Session[]
+  auditLogs       AuditLog[]
+  activityLogs    ActivityLog[]
+  notifications   Notification[]
+  securityLogs    SecurityLog[]
+
+  @@map("admins")
+}
+
+model Device {
+  id              String   @id @default(uuid())
+  deviceId        String   @unique
+  deviceName      String
+  model           String
+  manufacturer    String
+  androidVersion  String
+  appVersion      String
+  packageName     String   @default("com.rayan.client")
+  status          DeviceStatus @default(OFFLINE)
+  lastSeenAt      DateTime?
+  registeredAt    DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  isActive        Boolean  @default(true)
+  isLost          Boolean  @default(false)
+  isLocked        Boolean  @default(false)
+
+  // Device Information
+  battery         DeviceBattery?
+  cpu             DeviceCpu?
+  ram             DeviceRam?
+  storage         DeviceStorage?
+  network         DeviceNetwork?
+  health          DeviceHealth?
+  location        DeviceLocation?
+  statistics      DeviceStatistics?
+
+  // Relations
+  enrollments     Enrollment[]
+  apps            DeviceApp[]
+  logs            DeviceLog[]
+  securityAlerts  SecurityAlert[]
+  screenshots     Screenshot[]
+  fileTransfers   FileTransfer[]
+  screenSessions  ScreenSession[]
+  recordingSessions RecordingSession[]
+  sessionLogs     SessionLog[]
+  securityLogs    SecurityLog[]
+
+  @@map("devices")
+}
+
+model Enrollment {
+  id              String   @id @default(uuid())
+  pin             String   @unique
+  deviceName      String?
+  deviceId        String?
+  status          EnrollmentStatus @default(PENDING)
+  expiresAt       DateTime
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  adminId         String?
+  admin           Admin?   @relation(fields: [adminId], references: [id])
+  deviceIdFinal   String?
+  device          Device?  @relation(fields: [deviceIdFinal], references: [id])
+
+  @@map("enrollments")
+}
+
+model Session {
+  id              String   @id @default(uuid())
+  token           String   @unique
+  refreshToken    String   @unique
+  deviceInfo      String?
+  ipAddress       String?
+  userAgent       String?
+  expiresAt       DateTime
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  isRevoked       Boolean  @default(false)
+
+  adminId         String
+  admin           Admin    @relation(fields: [adminId], references: [id])
+
+  @@map("sessions")
+}
+
+model RefreshToken {
+  id              String   @id @default(uuid())
+  token           String   @unique
+  expiresAt       DateTime
+  createdAt       DateTime @default(now())
+  isRevoked       Boolean  @default(false)
+  adminId         String
+  admin           Admin    @relation(fields: [adminId], references: [id])
+
+  @@map("refresh_tokens")
+}
+
+model DeviceLocation {
+  id              String   @id @default(uuid())
+  latitude        Float
+  longitude       Float
+  altitude        Float?
+  accuracy        Float?
+  speed           Float?
+  heading         Float?
+  provider        String?
+  isGpsEnabled    Boolean?
+  isNetworkEnabled Boolean?
+  timestamp       DateTime @default(now())
+
+  deviceId        String
+  device          Device   @relation(fields: [deviceId], references: [id])
+
+  @@index([deviceId, timestamp])
+  @@map("device_locations")
+}
+
+model DeviceBattery {
+  id              String   @id @default(uuid())
+  level           Int
+  isCharging      Boolean
+  scale           Int?
+  temperature     Float?
+  voltage         Float?
+  health          String?
+  technology      String?
+  timestamp       DateTime @default(now())
+
+  deviceId        String   @unique
+  device          Device   @relation(fields: [deviceId], references: [id])
+
+  @@map("device_batteries")
+}
+
+model DeviceCpu {
+  id              String   @id @default(uuid())
+  cores           Int
+  usage           Float
+  frequency       Float?
+  temperature     Float?
+  architecture    String?
+  timestamp       DateTime @default(now())
+
+  deviceId        String   @unique
+  device          Device   @relation(fields: [deviceId], references: [id])
+
+  @@map("device_cpus")
+}
+
+model DeviceRam {
+  id              String   @id @default(uuid())
+  total           BigInt
+  used            BigInt
+  free            BigInt
+  usagePercentage Float
+  timestamp       DateTime @default(now())
+
+  deviceId        String   @unique
+  device          Device   @relation(fields: [deviceId], references: [id])
+
+  @@map("device_rams")
+}
+
+model DeviceStorage {
+  id              String   @id @default(uuid())
+  total           BigInt
+  used            BigInt
+  free            BigInt
+  usagePercentage Float
+  timestamp       DateTime @default(now())
+
+  deviceId        String   @unique
+  device          Device   @relation(fields: [deviceId], references: [id])
+
+  @@map("device_storages")
+}
+
+model DeviceNetwork {
+  id              String   @id @default(uuid())
+  type            String
+  ssid            String?
+  signalStrength  Int?
+  linkSpeed       Int?
+  ipAddress       String?
+  macAddress      String?
+  isConnected     Boolean
+  timestamp       DateTime @default(now())
+
+  deviceId        String   @unique
+  device          Device   @relation(fields: [deviceId], references: [id])
+
+  @@map("device_networks")
+}
+
+model DeviceHealth {
+  id              String   @id @default(uuid())
+  batteryHealth   String?
+  storageHealth   String?
+  performanceHealth String?
+  overallHealth   String
+  issues          String?
+  timestamp       DateTime @default(now())
+
+  deviceId        String   @unique
+  device          Device   @relation(fields: [deviceId], references: [id])
+
+  @@map("device_health")
+}
+
+model DeviceStatistics {
+  id              String   @id @default(uuid())
+  uptime          BigInt?
+  activeTime      BigInt?
+  screenOnTime    BigInt?
+  totalCrash      Int?
+  totalANR        Int?
+  totalWifi       Int?
+  totalCellular   Int?
+  timestamp       DateTime @default(now())
+
+  deviceId        String   @unique
+  device          Device   @relation(fields: [deviceId], references: [id])
+
+  @@map("device_statistics")
+}
+
+model DeviceApp {
+  id              String   @id @default(uuid())
+  packageName     String
+  appName         String
+  version         String
+  isSystem        Boolean
+  isRunning       Boolean
+  isInstalled     Boolean
+  installTime     DateTime?
+  updateTime      DateTime?
+  lastUsed        DateTime?
+  timestamp       DateTime @default(now())
+
+  deviceId        String
+  device          Device   @relation(fields: [deviceId], references: [id])
+
+  @@unique([deviceId, packageName])
+  @@index([deviceId, isRunning])
+  @@map("device_apps")
+}
+
+model DeviceLog {
+  id              String   @id @default(uuid())
+  event           String
+  message         String?
+  data            Json?
+  level           String   @default("INFO")
+  timestamp       DateTime @default(now())
+
+  deviceId        String
+  device          Device   @relation(fields: [deviceId], references: [id])
+
+  @@index([deviceId, timestamp])
+  @@map("device_logs")
+}
+
+model ScreenSession {
+  id              String   @id @default(uuid())
+  sessionToken    String   @unique
+  status          ScreenSessionStatus @default(REQUESTED)
+  startedAt       DateTime @default(now())
+  endedAt         DateTime?
+  duration        Int?
+
+  adminId         String
+  admin           Admin    @relation(fields: [adminId], references: [id])
+  deviceId        String
+  device          Device   @relation(fields: [deviceId], references: [id])
+
+  @@map("screen_sessions")
+}
+
+model RecordingSession {
+  id              String   @id @default(uuid())
+  sessionToken    String   @unique
+  status          RecordingSessionStatus @default(REQUESTED)
+  startedAt       DateTime @default(now())
+  endedAt         DateTime?
+  duration        Int?
+  filePath        String?
+  fileSize        BigInt?
+
+  adminId         String
+  admin           Admin    @relation(fields: [adminId], references: [id])
+  deviceId        String
+  device          Device   @relation(fields: [deviceId], references: [id])
+
+  @@map("recording_sessions")
+}
+
+model Screenshot {
+  id              String   @id @default(uuid())
+  filePath        String
+  fileSize        BigInt
+  width           Int?
+  height          Int?
+  capturedAt      DateTime @default(now())
+
+  adminId         String
+  admin           Admin    @relation(fields: [adminId], references: [id])
+  deviceId        String
+  device          Device   @relation(fields: [deviceId], references: [id])
+
+  @@map("screenshots")
+}
+
+model Geofence {
+  id              String   @id @default(uuid())
+  name            String
+  description     String?
+  latitude        Float
+  longitude       Float
+  radius          Float    // in meters
+  isActive        Boolean  @default(true)
+  triggerOnEnter  Boolean  @default(true)
+  triggerOnExit   Boolean  @default(true)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  adminId         String
+  admin           Admin    @relation(fields: [adminId], references: [id])
+
+  @@map("geofences")
+}
+
+model Notification {
+  id              String   @id @default(uuid())
+  title           String
+  message         String
+  type            NotificationType
+  isRead          Boolean  @default(false)
+  data            Json?
+  timestamp       DateTime @default(now())
+
+  adminId         String?
+  admin           Admin?   @relation(fields: [adminId], references: [id])
+  deviceId        String?
+  device          Device?  @relation(fields: [deviceId], references: [id])
+
+  @@index([adminId, timestamp])
+  @@map("notifications")
+}
+
+model SecurityAlert {
+  id              String   @id @default(uuid())
+  type            SecurityAlertType
+  severity        SecurityAlertSeverity @default(MEDIUM)
+  message         String
+  data            Json?
+  isResolved      Boolean  @default(false)
+  resolvedAt      DateTime?
+  timestamp       DateTime @default(now())
+
+  deviceId        String
+  device          Device   @relation(fields: [deviceId], references: [id])
+
+  @@index([deviceId, timestamp])
+  @@map("security_alerts")
+}
+
+model FileTransfer {
+  id              String   @id @default(uuid())
+  fileName        String
+  filePath        String
+  fileSize        BigInt
+  mimeType        String
+  direction       TransferDirection @default(UPLOAD)
+  status          TransferStatus @default(PENDING)
+  progress        Int      @default(0)
+  completedAt     DateTime?
+  timestamp       DateTime @default(now())
+
+  adminId         String
+  admin           Admin    @relation(fields: [adminId], references: [id])
+  deviceId        String
+  device          Device   @relation(fields: [deviceId], references: [id])
+
+  @@map("file_transfers")
+}
+
+model AuditLog {
+  id              String   @id @default(uuid())
+  action          String
+  resource        String
+  resourceId      String?
+  changes         Json?
+  ipAddress       String?
+  userAgent       String?
+  timestamp       DateTime @default(now())
+
+  adminId         String
+  admin           Admin    @relation(fields: [adminId], references: [id])
+
+  @@index([adminId, timestamp])
+  @@map("audit_logs")
+}
+
+model ActivityLog {
+  id              String   @id @default(uuid())
+  activity        String
+  description     String?
+  data            Json?
+  timestamp       DateTime @default(now())
+
+  adminId         String
+  admin           Admin    @relation(fields: [adminId], references: [id])
+
+  @@map("activity_logs")
+}
+
+model SecurityLog {
+  id              String   @id @default(uuid())
+  event           String
+  severity        String
+  message         String
+  data            Json?
+  ipAddress       String?
+  timestamp       DateTime @default(now())
+
+  adminId         String?
+  admin           Admin?   @relation(fields: [adminId], references: [id])
+  deviceId        String?
+  device          Device?  @relation(fields: [deviceId], references: [id])
+
+  @@index([timestamp])
+  @@map("security_logs")
+}
+
+model SessionLog {
+  id              String   @id @default(uuid())
+  event           String
+  description     String?
+  data            Json?
+  ipAddress       String?
+  timestamp       DateTime @default(now())
+
+  deviceId        String
+  device          Device   @relation(fields: [deviceId], references: [id])
+
+  @@index([deviceId, timestamp])
+  @@map("session_logs")
+}
+
+enum Role {
+  SUPER_ADMIN
+  ADMIN
+  VIEWER
+}
+
+enum DeviceStatus {
+  ONLINE
+  OFFLINE
+  MAINTENANCE
+  LOST
+  LOCKED
+}
+
+enum EnrollmentStatus {
+  PENDING
+  ACTIVE
+  EXPIRED
+  REVOKED
+  COMPLETED
+}
+
+enum ScreenSessionStatus {
+  REQUESTED
+  ACCEPTED
+  REJECTED
+  ACTIVE
+  ENDED
+  TIMEOUT
+}
+
+enum RecordingSessionStatus {
+  REQUESTED
+  ACCEPTED
+  REJECTED
+  ACTIVE
+  ENDED
+  TIMEOUT
+}
+
+enum NotificationType {
+  INFO
+  WARNING
+  SUCCESS
+  ERROR
+  ALERT
+}
+
+enum SecurityAlertType {
+  UNAUTHORIZED_ACCESS
+  SUSPICIOUS_ACTIVITY
+  BRUTE_FORCE
+  MALWARE
+  ROOT_DETECTED
+  VPN_DETECTED
+  SCREEN_RECORDING
+}
+
+enum SecurityAlertSeverity {
+  LOW
+  MEDIUM
+  HIGH
+  CRITICAL
+}
+
+enum TransferDirection {
+  UPLOAD
+  DOWNLOAD
+}
+
+enum TransferStatus {
+  PENDING
+  IN_PROGRESS
+  COMPLETED
+  FAILED
+  CANCELLED
+}
