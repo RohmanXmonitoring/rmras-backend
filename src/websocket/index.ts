@@ -1,528 +1,808 @@
 // src/websocket/index.ts
-import { Server as SocketServer, Socket } from 'socket.io';
-import { prisma, redis } from '../config';
+export * from './admin.handlers';
+export * from './device.handlers';
+export * from './events';
+
+// src/websocket/admin.handlers.ts
+import { Socket } from 'socket.io';
 import { logger } from '../utils/logger';
-import jwt from 'jsonwebtoken';
+import { prisma, redis } from '../config';
 
-interface SocketData {
-  adminId?: string;
-  deviceId?: string;
-}
+export class AdminHandlers {
+  constructor(private socket: Socket) {}
 
-export const setupWebSocket = (io: SocketServer) => {
-  // Admin namespace
-  const adminNamespace = io.of('/admin');
-  // Device namespace
-  const deviceNamespace = io.of('/device');
-
-  // Admin authentication middleware
-  adminNamespace.use(async (socket: Socket, next) => {
-    try {
-      const token = socket.handshake.auth.token;
-      if (!token) {
-        return next(new Error('Authentication required'));
-      }
-
-      const decoded = jwt.verify(token, process.env.JWT_SECRET!);
-      const session = await prisma.session.findUnique({
-        where: { token },
-        include: { admin: true },
-      });
-
-      if (!session || session.isRevoked || session.expiresAt < new Date()) {
-        return next(new Error('Invalid or expired session'));
-      }
-
-      (socket.data as SocketData).adminId = session.admin.id;
-      next();
-    } catch (error) {
-      next(new Error('Authentication failed'));
-    }
-  });
-
-  // Device authentication middleware
-  deviceNamespace.use(async (socket: Socket, next) => {
-    try {
-      const deviceId = socket.handshake.auth.deviceId;
-      const token = socket.handshake.auth.token;
-
-      if (!deviceId || !token) {
-        return next(new Error('Authentication required'));
-      }
-
-      // Validate device token
-      const device = await prisma.device.findUnique({
-        where: { deviceId },
-      });
-
-      if (!device || !device.isActive) {
-        return next(new Error('Device not found or inactive'));
-      }
-
-      // Verify token (you can implement device-specific token validation)
-      const isValid = await verifyDeviceToken(deviceId, token);
-      if (!isValid) {
-        return next(new Error('Invalid device token'));
-      }
-
-      (socket.data as SocketData).deviceId = deviceId;
-      next();
-    } catch (error) {
-      next(new Error('Authentication failed'));
-    }
-  });
-
-  // Admin socket handlers
-  adminNamespace.on('connection', (socket: Socket) => {
-    const adminId = (socket.data as SocketData).adminId!;
+  async handleConnection() {
+    const adminId = (this.socket.data as any).adminId;
     logger.info(`Admin connected: ${adminId}`);
-
+    
     // Join admin room
-    socket.join(`admin:${adminId}`);
-
+    this.socket.join(`admin:${adminId}`);
+    
     // Emit connection event
-    socket.emit('admin:connected', { adminId });
+    this.socket.emit('admin:connected', { adminId });
+  }
 
-    // Handle device monitoring
-    socket.on('device:subscribe', async (deviceId: string) => {
-      socket.join(`device:${deviceId}`);
-      logger.info(`Admin ${adminId} subscribed to device ${deviceId}`);
-    });
+  async handleDisconnection() {
+    const adminId = (this.socket.data as any).adminId;
+    logger.info(`Admin disconnected: ${adminId}`);
+    
+    this.socket.emit('admin:disconnected', { adminId });
+  }
 
-    socket.on('device:unsubscribe', async (deviceId: string) => {
-      socket.leave(`device:${deviceId}`);
-      logger.info(`Admin ${adminId} unsubscribed from device ${deviceId}`);
-    });
+  async handleDeviceSubscribe(deviceId: string) {
+    const adminId = (this.socket.data as any).adminId;
+    this.socket.join(`device:${deviceId}`);
+    logger.info(`Admin ${adminId} subscribed to device ${deviceId}`);
+  }
 
-    // Handle remote assistance
-    socket.on('remote:request', async (data) => {
-      const { deviceId, sessionType } = data;
-      logger.info(`Remote assistance requested for device ${deviceId} by admin ${adminId}`);
+  async handleDeviceUnsubscribe(deviceId: string) {
+    const adminId = (this.socket.data as any).adminId;
+    this.socket.leave(`device:${deviceId}`);
+    logger.info(`Admin ${adminId} unsubscribed from device ${deviceId}`);
+  }
 
-      // Store session in Redis for device to poll
-      await redis.setex(
-        `remote:request:${deviceId}`,
-        60,
-        JSON.stringify({
-          adminId,
-          sessionType,
-          timestamp: new Date().toISOString(),
-        })
-      );
+  async handleRemoteRequest(data: any) {
+    const { deviceId, sessionType } = data;
+    const adminId = (this.socket.data as any).adminId;
+    
+    logger.info(`Remote assistance requested for device ${deviceId} by admin ${adminId}`);
 
-      // Notify device
-      deviceNamespace.to(`device:${deviceId}`).emit('remote:request', {
+    // Store session in Redis
+    const sessionId = `remote_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+    await redis.setex(
+      `remote:request:${deviceId}`,
+      60,
+      JSON.stringify({
+        sessionId,
         adminId,
         sessionType,
-        requestId: generateRequestId(),
-      });
+        timestamp: new Date().toISOString(),
+      })
+    );
 
-      // Notify admin
-      socket.emit('remote:requested', { deviceId, status: 'pending' });
+    // Notify device
+    this.socket.to(`device:${deviceId}`).emit('remote:request', {
+      sessionId,
+      adminId,
+      sessionType,
+      timestamp: new Date().toISOString(),
     });
 
-    // Handle screen sharing
-    socket.on('screen:start', async (data) => {
-      const { deviceId, sessionId } = data;
-      logger.info(`Screen sharing started for device ${deviceId}`);
+    // Notify admin
+    this.socket.emit('remote:requested', { 
+      deviceId, 
+      sessionId,
+      status: 'pending' 
+    });
+  }
 
-      // Create screen session in database
-      const session = await prisma.screenSession.create({
+  async handleRemoteResponse(data: any) {
+    const { sessionId, accepted } = data;
+    const adminId = (this.socket.data as any).adminId;
+    
+    logger.info(`Remote response from device: ${accepted ? 'accepted' : 'rejected'}`);
+
+    // Get admin from Redis
+    const requestData = await redis.get(`remote:request:${sessionId}`);
+    if (requestData) {
+      const parsed = JSON.parse(requestData);
+      this.socket.to(`admin:${parsed.adminId}`).emit('remote:response', {
+        sessionId,
+        accepted,
+        timestamp: new Date().toISOString(),
+      });
+      await redis.del(`remote:request:${sessionId}`);
+    }
+  }
+
+  async handleScreenStart(data: any) {
+    const { deviceId, sessionId } = data;
+    const adminId = (this.socket.data as any).adminId;
+    
+    logger.info(`Screen sharing started for device ${deviceId}`);
+
+    // Create screen session in database
+    const device = await prisma.device.findUnique({
+      where: { deviceId },
+    });
+
+    if (device) {
+      await prisma.screenSession.create({
         data: {
           sessionToken: sessionId,
           status: 'ACTIVE',
           adminId,
-          deviceId,
+          deviceId: device.id,
         },
       });
+    }
 
-      // Notify device
-      deviceNamespace.to(`device:${deviceId}`).emit('screen:start', {
-        sessionId,
-        adminId,
-      });
-
-      socket.emit('screen:started', { deviceId, sessionId });
+    // Notify device
+    this.socket.to(`device:${deviceId}`).emit('screen:start', {
+      sessionId,
+      adminId,
+      timestamp: new Date().toISOString(),
     });
 
-    socket.on('screen:stop', async (data) => {
-      const { deviceId, sessionId } = data;
-      logger.info(`Screen sharing stopped for device ${deviceId}`);
+    this.socket.emit('screen:started', { 
+      deviceId, 
+      sessionId,
+      status: 'active' 
+    });
+  }
 
-      // Update session
-      await prisma.screenSession.update({
-        where: { sessionToken: sessionId },
-        data: {
-          status: 'ENDED',
-          endedAt: new Date(),
-        },
-      });
+  async handleScreenStop(data: any) {
+    const { deviceId, sessionId } = data;
+    const adminId = (this.socket.data as any).adminId;
+    
+    logger.info(`Screen sharing stopped for device ${deviceId}`);
 
-      // Notify device
-      deviceNamespace.to(`device:${deviceId}`).emit('screen:stop', {
-        sessionId,
-      });
-
-      socket.emit('screen:stopped', { deviceId, sessionId });
+    // Update session
+    await prisma.screenSession.update({
+      where: { sessionToken: sessionId },
+      data: {
+        status: 'ENDED',
+        endedAt: new Date(),
+      },
     });
 
-    // Handle device actions
-    socket.on('action:notification', async (data) => {
-      const { deviceId, title, message, data: extraData } = data;
-      logger.info(`Sending notification to device ${deviceId}`);
+    // Notify device
+    this.socket.to(`device:${deviceId}`).emit('screen:stop', {
+      sessionId,
+      timestamp: new Date().toISOString(),
+    });
 
-      // Store notification
+    this.socket.emit('screen:stopped', { 
+      deviceId, 
+      sessionId,
+      status: 'ended' 
+    });
+  }
+
+  async handleActionNotification(data: any) {
+    const { deviceId, title, message, type, extraData } = data;
+    const adminId = (this.socket.data as any).adminId;
+    
+    logger.info(`Sending notification to device ${deviceId}`);
+
+    // Store notification
+    const device = await prisma.device.findUnique({
+      where: { deviceId },
+    });
+
+    if (device) {
       await prisma.notification.create({
         data: {
           title,
           message,
-          type: 'INFO',
+          type: type || 'INFO',
           data: extraData,
           adminId,
-          deviceId,
+          deviceId: device.id,
         },
       });
+    }
 
-      // Send to device
-      deviceNamespace.to(`device:${deviceId}`).emit('notification:push', {
-        title,
-        message,
-        data: extraData,
-        timestamp: new Date().toISOString(),
-      });
-
-      socket.emit('notification:sent', { deviceId, success: true });
+    // Send to device
+    this.socket.to(`device:${deviceId}`).emit('notification:push', {
+      title,
+      message,
+      type: type || 'INFO',
+      data: extraData,
+      timestamp: new Date().toISOString(),
     });
 
-    socket.on('action:lost-mode', async (data) => {
-      const { deviceId, enable } = data;
-      logger.info(`${enable ? 'Enabling' : 'Disabling'} lost mode for device ${deviceId}`);
+    this.socket.emit('notification:sent', { 
+      deviceId, 
+      success: true 
+    });
+  }
 
-      await prisma.device.update({
-        where: { deviceId },
-        data: { isLost: enable },
-      });
+  async handleActionLostMode(data: any) {
+    const { deviceId, enable } = data;
+    const adminId = (this.socket.data as any).adminId;
+    
+    logger.info(`${enable ? 'Enabling' : 'Disabling'} lost mode for device ${deviceId}`);
 
-      deviceNamespace.to(`device:${deviceId}`).emit('action:lost-mode', { enable });
-      socket.emit('lost-mode:updated', { deviceId, enable });
+    await prisma.device.update({
+      where: { deviceId },
+      data: { isLost: enable },
     });
 
-    // Handle disconnection
-    socket.on('disconnect', () => {
-      logger.info(`Admin disconnected: ${adminId}`);
-      socket.emit('admin:disconnected', { adminId });
+    this.socket.to(`device:${deviceId}`).emit('action:lost-mode', { 
+      enable,
+      timestamp: new Date().toISOString(),
     });
-  });
+    
+    this.socket.emit('lost-mode:updated', { 
+      deviceId, 
+      enable,
+      status: 'success' 
+    });
+  }
 
-  // Device socket handlers
-  deviceNamespace.on('connection', (socket: Socket) => {
-    const deviceId = (socket.data as SocketData).deviceId!;
+  async handleActionLock(data: any) {
+    const { deviceId, lock } = data;
+    const adminId = (this.socket.data as any).adminId;
+    
+    logger.info(`${lock ? 'Locking' : 'Unlocking'} device ${deviceId}`);
+
+    await prisma.device.update({
+      where: { deviceId },
+      data: { isLocked: lock },
+    });
+
+    this.socket.to(`device:${deviceId}`).emit('action:lock', { 
+      lock,
+      timestamp: new Date().toISOString(),
+    });
+    
+    this.socket.emit('lock:updated', { 
+      deviceId, 
+      lock,
+      status: 'success' 
+    });
+  }
+
+  async handleActionRing(data: any) {
+    const { deviceId } = data;
+    const adminId = (this.socket.data as any).adminId;
+    
+    logger.info(`Ringing device ${deviceId}`);
+
+    this.socket.to(`device:${deviceId}`).emit('action:ring', {
+      timestamp: new Date().toISOString(),
+    });
+    
+    this.socket.emit('ring:sent', { 
+      deviceId, 
+      status: 'success' 
+    });
+  }
+
+  async handleActionMessage(data: any) {
+    const { deviceId, message } = data;
+    const adminId = (this.socket.data as any).adminId;
+    
+    logger.info(`Sending message to device ${deviceId}`);
+
+    this.socket.to(`device:${deviceId}`).emit('action:message', {
+      message,
+      adminId,
+      timestamp: new Date().toISOString(),
+    });
+    
+    this.socket.emit('message:sent', { 
+      deviceId, 
+      status: 'success' 
+    });
+  }
+}
+
+// src/websocket/device.handlers.ts
+import { Socket } from 'socket.io';
+import { logger } from '../utils/logger';
+import { prisma, redis } from '../config';
+
+export class DeviceHandlers {
+  constructor(private socket: Socket) {}
+
+  async handleConnection() {
+    const deviceId = (this.socket.data as any).deviceId;
     logger.info(`Device connected: ${deviceId}`);
 
     // Join device room
-    socket.join(`device:${deviceId}`);
+    this.socket.join(`device:${deviceId}`);
 
     // Update device status to online
-    prisma.device.update({
+    await prisma.device.update({
       where: { deviceId },
-      data: { 
+      data: {
         status: 'ONLINE',
         lastSeenAt: new Date(),
       },
-    }).catch(error => {
-      logger.error('Failed to update device status:', error);
     });
 
     // Emit connection event
-    socket.emit('device:connected', { deviceId });
+    this.socket.emit('device:connected', { deviceId });
+  }
 
-    // Handle device status updates
-    socket.on('device:status', async (data) => {
-      logger.info(`Device ${deviceId} status update:`, data);
+  async handleDisconnection() {
+    const deviceId = (this.socket.data as any).deviceId;
+    logger.info(`Device disconnected: ${deviceId}`);
 
-      // Update device in database
-      await prisma.device.update({
-        where: { deviceId },
-        data: {
-          status: data.status,
-          lastSeenAt: new Date(),
-        },
-      });
-
-      // Notify subscribed admins
-      adminNamespace.to(`device:${deviceId}`).emit('device:status', {
-        deviceId,
-        ...data,
-        timestamp: new Date().toISOString(),
-      });
+    // Update device status to offline
+    await prisma.device.update({
+      where: { deviceId },
+      data: {
+        status: 'OFFLINE',
+        lastSeenAt: new Date(),
+      },
     });
 
-    // Handle device information updates
-    socket.on('device:info', async (data) => {
-      logger.info(`Device ${deviceId} info update:`, data);
+    // Notify subscribed admins
+    this.socket.to(`device:${deviceId}`).emit('device:disconnected', {
+      deviceId,
+      timestamp: new Date().toISOString(),
+    });
+  }
 
-      // Update device basic info
-      await prisma.device.update({
-        where: { deviceId },
-        data: {
-          deviceName: data.deviceName,
-          model: data.model,
-          manufacturer: data.manufacturer,
-          androidVersion: data.androidVersion,
-          appVersion: data.appVersion,
-        },
-      });
+  async handleStatus(data: any) {
+    const deviceId = (this.socket.data as any).deviceId;
+    logger.info(`Device ${deviceId} status update:`, data);
 
-      adminNamespace.to(`device:${deviceId}`).emit('device:info', {
-        deviceId,
-        ...data,
-        timestamp: new Date().toISOString(),
-      });
+    await prisma.device.update({
+      where: { deviceId },
+      data: {
+        status: data.status,
+        lastSeenAt: new Date(),
+      },
     });
 
-    // Handle battery updates
-    socket.on('device:battery', async (data) => {
-      logger.info(`Device ${deviceId} battery update:`, data);
+    // Notify subscribed admins
+    this.socket.to(`device:${deviceId}`).emit('device:status', {
+      deviceId,
+      ...data,
+      timestamp: new Date().toISOString(),
+    });
+  }
 
+  async handleInfo(data: any) {
+    const deviceId = (this.socket.data as any).deviceId;
+    logger.info(`Device ${deviceId} info update:`, data);
+
+    await prisma.device.update({
+      where: { deviceId },
+      data: {
+        deviceName: data.deviceName,
+        model: data.model,
+        manufacturer: data.manufacturer,
+        androidVersion: data.androidVersion,
+        appVersion: data.appVersion,
+      },
+    });
+
+    this.socket.to(`device:${deviceId}`).emit('device:info', {
+      deviceId,
+      ...data,
+      timestamp: new Date().toISOString(),
+    });
+  }
+
+  async handleBattery(data: any) {
+    const deviceId = (this.socket.data as any).deviceId;
+    logger.info(`Device ${deviceId} battery update:`, data);
+
+    const device = await prisma.device.findUnique({
+      where: { deviceId },
+    });
+
+    if (device) {
       await prisma.deviceBattery.upsert({
-        where: { deviceId },
+        where: { deviceId: device.id },
         update: {
-          level: data.level,
-          isCharging: data.isCharging,
-          temperature: data.temperature,
-          voltage: data.voltage,
+          ...data,
           timestamp: new Date(),
         },
         create: {
-          level: data.level,
-          isCharging: data.isCharging,
-          temperature: data.temperature,
-          voltage: data.voltage,
-          deviceId,
+          ...data,
+          deviceId: device.id,
         },
       });
 
-      adminNamespace.to(`device:${deviceId}`).emit('device:battery', {
-        deviceId,
-        ...data,
-        timestamp: new Date().toISOString(),
-      });
+      // Check low battery
+      if (data.level < 15 && !data.isCharging) {
+        await this.sendLowBatteryAlert(deviceId, data.level);
+      }
+    }
+
+    this.socket.to(`device:${deviceId}`).emit('device:battery', {
+      deviceId,
+      ...data,
+      timestamp: new Date().toISOString(),
+    });
+  }
+
+  async handleLocation(data: any) {
+    const deviceId = (this.socket.data as any).deviceId;
+    logger.info(`Device ${deviceId} location update:`, data);
+
+    const device = await prisma.device.findUnique({
+      where: { deviceId },
     });
 
-    // Handle location updates
-    socket.on('device:location', async (data) => {
-      logger.info(`Device ${deviceId} location update:`, data);
-
+    if (device) {
       await prisma.deviceLocation.create({
         data: {
-          latitude: data.latitude,
-          longitude: data.longitude,
-          altitude: data.altitude,
-          accuracy: data.accuracy,
-          speed: data.speed,
-          heading: data.heading,
-          provider: data.provider,
-          isGpsEnabled: data.isGpsEnabled,
-          isNetworkEnabled: data.isNetworkEnabled,
-          deviceId,
+          ...data,
+          deviceId: device.id,
         },
       });
 
-      adminNamespace.to(`device:${deviceId}`).emit('device:location', {
-        deviceId,
-        ...data,
-        timestamp: new Date().toISOString(),
-      });
+      // Update Redis cache
+      await redis.setex(
+        `device:location:${deviceId}`,
+        3600,
+        JSON.stringify({
+          ...data,
+          timestamp: new Date().toISOString(),
+        })
+      );
+
+      // Check geofences
+      await this.checkGeofences(device.id, data.latitude, data.longitude);
+    }
+
+    this.socket.to(`device:${deviceId}`).emit('device:location', {
+      deviceId,
+      ...data,
+      timestamp: new Date().toISOString(),
+    });
+  }
+
+  async handleNetwork(data: any) {
+    const deviceId = (this.socket.data as any).deviceId;
+    logger.info(`Device ${deviceId} network update:`, data);
+
+    const device = await prisma.device.findUnique({
+      where: { deviceId },
     });
 
-    // Handle network updates
-    socket.on('device:network', async (data) => {
-      logger.info(`Device ${deviceId} network update:`, data);
-
+    if (device) {
       await prisma.deviceNetwork.upsert({
-        where: { deviceId },
+        where: { deviceId: device.id },
         update: {
-          type: data.type,
-          ssid: data.ssid,
-          signalStrength: data.signalStrength,
-          linkSpeed: data.linkSpeed,
-          ipAddress: data.ipAddress,
-          macAddress: data.macAddress,
-          isConnected: data.isConnected,
+          ...data,
           timestamp: new Date(),
         },
         create: {
-          type: data.type,
-          ssid: data.ssid,
-          signalStrength: data.signalStrength,
-          linkSpeed: data.linkSpeed,
-          ipAddress: data.ipAddress,
-          macAddress: data.macAddress,
-          isConnected: data.isConnected,
-          deviceId,
+          ...data,
+          deviceId: device.id,
         },
       });
+    }
 
-      adminNamespace.to(`device:${deviceId}`).emit('device:network', {
-        deviceId,
-        ...data,
-        timestamp: new Date().toISOString(),
-      });
+    this.socket.to(`device:${deviceId}`).emit('device:network', {
+      deviceId,
+      ...data,
+      timestamp: new Date().toISOString(),
+    });
+  }
+
+  async handleApps(data: any) {
+    const deviceId = (this.socket.data as any).deviceId;
+    logger.info(`Device ${deviceId} apps update:`, data);
+
+    const device = await prisma.device.findUnique({
+      where: { deviceId },
     });
 
-    // Handle installed apps update
-    socket.on('device:apps', async (data) => {
-      logger.info(`Device ${deviceId} apps update:`, data);
-
+    if (device) {
       // Delete old apps
       await prisma.deviceApp.deleteMany({
-        where: { deviceId },
+        where: { deviceId: device.id },
       });
 
       // Insert new apps
-      await prisma.deviceApp.createMany({
-        data: data.apps.map((app: any) => ({
-          ...app,
-          deviceId,
-          timestamp: new Date(),
-        })),
-      });
-
-      adminNamespace.to(`device:${deviceId}`).emit('device:apps', {
-        deviceId,
-        apps: data.apps,
-        timestamp: new Date().toISOString(),
-      });
-    });
-
-    // Handle remote assistance response
-    socket.on('remote:response', async (data) => {
-      const { requestId, accepted } = data;
-      logger.info(`Device ${deviceId} remote assistance response: ${accepted}`);
-
-      // Get admin from Redis
-      const requestData = await redis.get(`remote:request:${deviceId}`);
-      if (requestData) {
-        const parsed = JSON.parse(requestData);
-        adminNamespace.to(`admin:${parsed.adminId}`).emit('remote:response', {
-          deviceId,
-          accepted,
-          requestId,
+      if (data.apps && data.apps.length > 0) {
+        await prisma.deviceApp.createMany({
+          data: data.apps.map((app: any) => ({
+            ...app,
+            deviceId: device.id,
+            timestamp: new Date(),
+          })),
         });
-        await redis.del(`remote:request:${deviceId}`);
       }
+    }
+
+    this.socket.to(`device:${deviceId}`).emit('device:apps', {
+      deviceId,
+      apps: data.apps,
+      timestamp: new Date().toISOString(),
     });
+  }
 
-    // Handle screenshot response
-    socket.on('screenshot:response', async (data) => {
-      const { requestId, imageData } = data;
-      logger.info(`Device ${deviceId} screenshot response`);
+  async handleRemoteResponse(data: any) {
+    const { sessionId, accepted } = data;
+    const deviceId = (this.socket.data as any).deviceId;
+    
+    logger.info(`Device ${deviceId} remote assistance response: ${accepted}`);
 
-      // Store screenshot
-      const screenshot = await prisma.screenshot.create({
-        data: {
-          filePath: `/storage/screenshots/${requestId}.jpg`,
-          fileSize: Buffer.byteLength(imageData, 'base64'),
-          adminId: data.adminId,
-          deviceId,
-        },
-      });
-
-      // Notify admin
-      adminNamespace.to(`admin:${data.adminId}`).emit('screenshot:received', {
-        requestId,
+    // Get admin from Redis
+    const requestData = await redis.get(`remote:request:${deviceId}`);
+    if (requestData) {
+      const parsed = JSON.parse(requestData);
+      this.socket.to(`admin:${parsed.adminId}`).emit('remote:response', {
         deviceId,
-        screenshotId: screenshot.id,
-        imageData,
+        accepted,
+        sessionId,
         timestamp: new Date().toISOString(),
       });
-    });
+      await redis.del(`remote:request:${deviceId}`);
+    }
+  }
 
-    // Handle file transfer
-    socket.on('file:upload', async (data) => {
-      const { fileId, chunk, chunkIndex, totalChunks } = data;
-      logger.info(`Device ${deviceId} file upload chunk ${chunkIndex}/${totalChunks}`);
+  async handleScreenshotResponse(data: any) {
+    const { requestId, imageData } = data;
+    const deviceId = (this.socket.data as any).deviceId;
+    
+    logger.info(`Device ${deviceId} screenshot response`);
 
-      // Store chunk in Redis
-      await redis.setex(
-        `file:chunk:${fileId}:${chunkIndex}`,
-        3600,
-        chunk
-      );
+    // Get request info from Redis
+    const request = await redis.get(`screenshot:request:${requestId}`);
+    if (request) {
+      const parsed = JSON.parse(request);
+      
+      // Store screenshot
+      const device = await prisma.device.findUnique({
+        where: { deviceId },
+      });
 
-      if (chunkIndex === totalChunks - 1) {
-        // All chunks received, assemble file
-        await assembleFile(fileId, totalChunks, deviceId);
-        adminNamespace.to(`device:${deviceId}`).emit('file:complete', {
-          fileId,
+      if (device) {
+        const screenshot = await prisma.screenshot.create({
+          data: {
+            filePath: `/storage/screenshots/${requestId}.jpg`,
+            fileSize: Buffer.byteLength(imageData, 'base64'),
+            adminId: parsed.adminId,
+            deviceId: device.id,
+          },
+        });
+
+        // Notify admin
+        this.socket.to(`admin:${parsed.adminId}`).emit('screenshot:received', {
+          requestId,
           deviceId,
+          screenshotId: screenshot.id,
+          imageData,
           timestamp: new Date().toISOString(),
         });
       }
-    });
 
-    // Handle file download
-    socket.on('file:download', async (data) => {
-      const { fileId, chunkIndex } = data;
-      logger.info(`Device ${deviceId} file download chunk ${chunkIndex}`);
+      await redis.del(`screenshot:request:${requestId}`);
+    }
+  }
 
-      // Get chunk from Redis
-      const chunk = await redis.get(`file:chunk:${fileId}:${chunkIndex}`);
-      if (chunk) {
-        socket.emit('file:chunk', {
-          fileId,
-          chunkIndex,
-          chunk,
-        });
-      }
-    });
+  async handleFileUpload(data: any) {
+    const { fileId, chunk, chunkIndex, totalChunks } = data;
+    const deviceId = (this.socket.data as any).deviceId;
+    
+    logger.info(`Device ${deviceId} file upload chunk ${chunkIndex}/${totalChunks}`);
 
-    // Handle disconnection
-    socket.on('disconnect', () => {
-      logger.info(`Device disconnected: ${deviceId}`);
+    // Store chunk in Redis
+    await redis.setex(
+      `file:chunk:${fileId}:${chunkIndex}`,
+      3600,
+      chunk
+    );
 
-      // Update device status to offline
-      prisma.device.update({
-        where: { deviceId },
-        data: { 
-          status: 'OFFLINE',
-          lastSeenAt: new Date(),
-        },
-      }).catch(error => {
-        logger.error('Failed to update device status:', error);
-      });
-
-      // Notify subscribed admins
-      adminNamespace.to(`device:${deviceId}`).emit('device:disconnected', {
+    if (chunkIndex === totalChunks - 1) {
+      // All chunks received, assemble file
+      await this.assembleFile(fileId, totalChunks, deviceId);
+      this.socket.to(`device:${deviceId}`).emit('file:complete', {
+        fileId,
         deviceId,
         timestamp: new Date().toISOString(),
       });
+    }
+  }
+
+  async handleFileDownload(data: any) {
+    const { fileId, chunkIndex } = data;
+    const deviceId = (this.socket.data as any).deviceId;
+    
+    logger.info(`Device ${deviceId} file download chunk ${chunkIndex}`);
+
+    // Get chunk from Redis
+    const chunk = await redis.get(`file:chunk:${fileId}:${chunkIndex}`);
+    if (chunk) {
+      this.socket.emit('file:chunk', {
+        fileId,
+        chunkIndex,
+        chunk,
+      });
+    }
+  }
+
+  async handleSecurityReport(data: any) {
+    const { type, severity, message, data: extraData } = data;
+    const deviceId = (this.socket.data as any).deviceId;
+    
+    logger.info(`Device ${deviceId} security report: ${type}`);
+
+    const device = await prisma.device.findUnique({
+      where: { deviceId },
     });
-  });
 
-  // Helper functions
-  function generateRequestId(): string {
-    return `req_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+    if (device) {
+      await prisma.securityAlert.create({
+        data: {
+          type,
+          severity,
+          message,
+          data: extraData,
+          deviceId: device.id,
+        },
+      });
+
+      // Notify admins for critical alerts
+      if (severity === 'CRITICAL' || severity === 'HIGH') {
+        this.socket.to(`device:${deviceId}`).emit('security:alert', {
+          deviceId,
+          type,
+          severity,
+          message,
+          timestamp: new Date().toISOString(),
+        });
+      }
+    }
   }
 
-  async function verifyDeviceToken(deviceId: string, token: string): Promise<boolean> {
-    // Implement device token validation
-    // You can use a simple token stored in database or JWT
-    return true;
+  private async sendLowBatteryAlert(deviceId: string, level: number) {
+    const device = await prisma.device.findUnique({
+      where: { deviceId },
+    });
+
+    if (device) {
+      await prisma.notification.create({
+        data: {
+          title: 'Low Battery Alert',
+          message: `Device ${device.deviceName} has low battery (${level}%)`,
+          type: 'WARNING',
+          data: { level },
+          deviceId: device.id,
+        },
+      });
+    }
+
+    this.socket.to(`device:${deviceId}`).emit('notification:push', {
+      title: 'Low Battery Alert',
+      message: `Device battery is at ${level}%`,
+      type: 'WARNING',
+      timestamp: new Date().toISOString(),
+    });
   }
 
-  async function assembleFile(fileId: string, totalChunks: number, deviceId: string) {
+  private async checkGeofences(deviceId: string, latitude: number, longitude: number) {
+    const geofences = await prisma.geofence.findMany({
+      where: { isActive: true },
+    });
+
+    for (const geofence of geofences) {
+      const distance = this.calculateDistance(
+        latitude,
+        longitude,
+        geofence.latitude,
+        geofence.longitude
+      );
+
+      const isInside = distance <= geofence.radius;
+      const key = `geofence:${geofence.id}:${deviceId}`;
+      const wasInside = await redis.get(key);
+
+      if (isInside && wasInside === 'false' && geofence.triggerOnEnter) {
+        await this.triggerGeofenceAlert(geofence, deviceId, 'ENTER');
+        await redis.setex(key, 3600, 'true');
+      } else if (!isInside && wasInside === 'true' && geofence.triggerOnExit) {
+        await this.triggerGeofenceAlert(geofence, deviceId, 'EXIT');
+        await redis.setex(key, 3600, 'false');
+      }
+    }
+  }
+
+  private calculateDistance(lat1: number, lon1: number, lat2: number, lon2: number): number {
+    const R = 6371e3;
+    const φ1 = lat1 * Math.PI / 180;
+    const φ2 = lat2 * Math.PI / 180;
+    const Δφ = (lat2 - lat1) * Math.PI / 180;
+    const Δλ = (lon2 - lon1) * Math.PI / 180;
+
+    const a = Math.sin(Δφ / 2) * Math.sin(Δφ / 2) +
+              Math.cos(φ1) * Math.cos(φ2) *
+              Math.sin(Δλ / 2) * Math.sin(Δλ / 2);
+    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+
+    return R * c;
+  }
+
+  private async triggerGeofenceAlert(geofence: any, deviceId: string, type: string) {
+    const device = await prisma.device.findUnique({
+      where: { id: deviceId },
+    });
+
+    if (device) {
+      await prisma.notification.create({
+        data: {
+          title: `Geofence ${type === 'ENTER' ? 'Entry' : 'Exit'}`,
+          message: `Device ${device.deviceName} ${type === 'ENTER' ? 'entered' : 'exited'} geofence ${geofence.name}`,
+          type: 'ALERT',
+          data: {
+            geofenceId: geofence.id,
+            geofenceName: geofence.name,
+            type,
+            deviceId: device.deviceId,
+          },
+          deviceId: device.id,
+        },
+      });
+    }
+
+    this.socket.to(`device:${deviceId}`).emit('geofence:alert', {
+      geofenceId: geofence.id,
+      geofenceName: geofence.name,
+      type,
+      deviceId,
+      timestamp: new Date().toISOString(),
+    });
+  }
+
+  private async assembleFile(fileId: string, totalChunks: number, deviceId: string) {
     // Implement file assembly from Redis chunks
     // Store file in filesystem and create database record
-    logger.info(`Assembling file ${fileId} with ${totalChunks} chunks`);
+    logger.info(`Assembling file ${fileId} with ${totalChunks} chunks from device ${deviceId}`);
   }
+}
 
-  // Error handling
-  io.on('error', (error) => {
-    logger.error('Socket.IO error:', error);
-  });
-
-  io.on('connection_error', (error) => {
-    logger.error('Socket.IO connection error:', error);
-  });
+// src/websocket/events.ts
+export const EVENTS = {
+  // Admin events
+  ADMIN_CONNECTED: 'admin:connected',
+  ADMIN_DISCONNECTED: 'admin:disconnected',
+  
+  // Device events
+  DEVICE_CONNECTED: 'device:connected',
+  DEVICE_DISCONNECTED: 'device:disconnected',
+  
+  // Device status events
+  DEVICE_STATUS: 'device:status',
+  DEVICE_BATTERY: 'device:battery',
+  DEVICE_NETWORK: 'device:network',
+  DEVICE_LOCATION: 'device:location',
+  DEVICE_HEALTH: 'device:health',
+  DEVICE_INFO: 'device:info',
+  DEVICE_APPS: 'device:apps',
+  
+  // Remote assistance events
+  REMOTE_REQUEST: 'remote:request',
+  REMOTE_RESPONSE: 'remote:response',
+  REMOTE_ACCEPTED: 'remote:accepted',
+  REMOTE_REJECTED: 'remote:rejected',
+  REMOTE_ENDED: 'remote:ended',
+  
+  // Screen sharing events
+  SCREEN_START: 'screen:start',
+  SCREEN_STOP: 'screen:stop',
+  SCREEN_STARTED: 'screen:started',
+  SCREEN_STOPPED: 'screen:stopped',
+  
+  // Recording events
+  RECORDING_START: 'recording:start',
+  RECORDING_STOP: 'recording:stop',
+  
+  // Screenshot events
+  SCREENSHOT_REQUEST: 'screenshot:request',
+  SCREENSHOT_RESPONSE: 'screenshot:response',
+  SCREENSHOT_RECEIVED: 'screenshot:received',
+  
+  // Notification events
+  NOTIFICATION_PUSH: 'notification:push',
+  NOTIFICATION_SENT: 'notification:sent',
+  
+  // Security events
+  SECURITY_ALERT: 'security:alert',
+  
+  // Geofence events
+  GEOFENCE_ALERT: 'geofence:alert',
+  
+  // File events
+  FILE_UPLOAD: 'file:upload',
+  FILE_DOWNLOAD: 'file:download',
+  FILE_COMPLETE: 'file:complete',
+  FILE_CHUNK: 'file:chunk',
+  
+  // Action events
+  ACTION_NOTIFICATION: 'action:notification',
+  ACTION_RING: 'action:ring',
+  ACTION_LOST_MODE: 'action:lost-mode',
+  ACTION_LOCK: 'action:lock',
+  ACTION_MESSAGE: 'action:message',
 };
